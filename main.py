@@ -8,6 +8,32 @@ from datetime import datetime, timedelta, timezone
 import os
 import requests
 
+from sqlalchemy import Column, Integer, String, Float, DateTime, create_engine
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from datetime import datetime
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://rag_user@postgres:5432/rag_logs")
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+class ParkingRecord(Base):
+    __tablename__ = "parking_records"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    phone_number = Column(String, index=True)
+    latitude = Column(Float)
+    longitude = Column(Float)
+    street = Column(String)
+    blockside = Column(String)
+    next_sweep_date = Column(String)
+    next_sweep_time = Column(String)
+    days_until_sweep = Column(Integer)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    notified = Column(Integer, default=0)  # 0 = not sent, 1 = sent
+
 # Load street sweeping schedule
 df = pd.read_csv("SSS.csv")
 df = df[df['Line'].notnull()]  
@@ -20,6 +46,12 @@ app = FastAPI()
 class Location(BaseModel):
     latitude: float
     longitude: float
+    phone_number: str
+
+# Startup event - creates tables when app starts
+@app.on_event("startup")
+def startup():
+    Base.metadata.create_all(bind=engine)
 
 @app.post("/next_sweep")
 def get_next_sweep(location: Location):
@@ -99,6 +131,22 @@ def get_next_sweep(location: Location):
             "next_sweep_time": (int(parking_loc_sss['FromHour'].iloc[0]), int(parking_loc_sss['ToHour'].iloc[0])),
             "days_until_sweep": int(days_until_sweep)
         }
+
+        db = SessionLocal()
+        parking_record = ParkingRecord(
+            phone_number=location.phone_number,
+            latitude=location.latitude,
+            longitude=location.longitude,
+            street=main_street,
+            blockside=blockside,
+            next_sweep_date=next_sweep_date,
+            next_sweep_time=str(rJSON["next_sweep_time"]),
+            days_until_sweep=int(days_until_sweep),
+            notified=0
+        )
+        db.add(parking_record)
+        db.commit()
+        db.close()
 
         # print(rJSON)
         return rJSON
