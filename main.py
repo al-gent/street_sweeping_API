@@ -8,38 +8,56 @@ from datetime import datetime, timedelta, timezone
 import os
 import requests
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, create_engine
+from sqlalchemy import Column, Integer, String, Float, DateTime, create_engine, Date
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import os
+from io import StringIO
+from zoneinfo import ZoneInfo
+from dotenv import load_dotenv
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://rag_user@postgres:5432/rag_logs")
+
+
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
 Base = declarative_base()
-
-class ParkingRecord(Base):
-    __tablename__ = "parking_records"
+class ParkingRecordDB(Base):
+    __tablename__ = 'parking_records'
     
-    id = Column(Integer, primary_key=True, index=True)
-    phone_number = Column(String, index=True)
-    latitude = Column(Float)
-    longitude = Column(Float)
-    street = Column(String)
-    blockside = Column(String)
-    next_sweep_date = Column(String)
-    next_sweep_time = Column(String)
-    days_until_sweep = Column(Integer)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    notified = Column(Integer, default=0)  # 0 = not sent, 1 = sent
+    id = Column(Integer, primary_key=True)
+    phone_number = Column(String(15), nullable=False)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    street_name = Column(String(255), nullable=False)
+    between = Column(String(255))
+    blockside = Column(String(50))
+    cnn = Column(Integer)
+    next_sweep_date = Column(Date)
+    next_sweep_time = Column(Integer)
+    created_at = Column(DateTime, default=datetime.now)
 
-# Load street sweeping schedule
-df = pd.read_csv("SSS.csv")
-df = df[df['Line'].notnull()]  
-df['Line'] = df['Line'].astype(str)
-df['geometry'] = df['Line'].apply(wkt.loads)
-gdf = gpd.GeoDataFrame(df, geometry='geometry')
+streets_response = requests.get('https://data.sfgov.org/resource/3psu-pn9h.csv?$limit=999999')
+all_streets = pd.read_csv(StringIO(streets_response.text))
+# all_streets = pd.read_csv('./streets.csv')
+all_streets.columns = all_streets.columns.str.lower()
+all_streets=all_streets[all_streets['active']]
+all_streets['line'] = all_streets['line'].astype(str)
+all_streets['geometry'] = all_streets['line'].apply(wkt.loads)
+all_streets = gpd.GeoDataFrame(all_streets, geometry='geometry')
+
+ss_response = requests.get('https://data.sfgov.org/resource/yhqp-riqs.csv?$limit=999999')
+ss = pd.read_csv(StringIO(ss_response.text))
+# ss = pd.read_csv('./SSS.csv')
+ss.columns = ss.columns.str.lower()
+
+ss = ss[ss['line'].notnull()]  
+ss['line'] = ss['line'].astype(str)
+ss['geometry'] = ss['line'].apply(wkt.loads)
+ss = gpd.GeoDataFrame(ss, geometry='geometry')
 
 app = FastAPI()
 
@@ -56,22 +74,51 @@ def startup():
 @app.post("/next_sweep")
 def get_next_sweep(location: Location):
     try:
-        # Get current time
-        now = datetime.now(timezone.utc)
-        
-        # Convert lat/lon to a point
+        now = datetime.now(ZoneInfo("America/Los_Angeles"))
+
         user_point = Point(location.longitude, location.latitude)
-        gdf['distance'] = gdf['geometry'].distance(user_point)
+        all_streets['distance'] = all_streets['geometry'].distance(user_point)
+        closest_street = all_streets.sort_values(by='distance')[:1]
+        main_street = closest_street['street'].values[0]
+        between = (closest_street['f_st'].values[0], closest_street['t_st'].values[0])
 
-        # Get the two closest street segments
-        closest_streets = gdf.sort_values(by='distance')[:2]
+        cnn = closest_street['cnn'].values[0]
+        print(main_street, between)
 
-        # if you're note close to any street it shouldnt just find the one you're closest to
-        if closest_streets.empty:
-            raise HTTPException(status_code=404, detail="No street sweeping data found.")
+        street_sides = ss[ss['cnn'] == int(cnn)]
+        if len(street_sides) == 0:
+            print('it appears that there is NO street sweeping here')
+            db_record = ParkingRecordDB(
+                phone_number=int(location.phone_number),
+                latitude=float(location.latitude),
+                longitude=float(location.longitude),
+                street_name=str(main_street),
+                between = str(between),
+                blockside = str('n/a'),
+                cnn = int(cnn),
+                next_sweep_date=None,
+                next_sweep_time=None
 
-        # Determine street side
-        line = closest_streets['geometry'].iloc[0]
+            )
+            db = SessionLocal()
+            db.add(db_record)
+            db.commit()
+            db.refresh(db_record)  
+            db.close()
+            
+            # Return a response
+            return {
+                "message": "Parking record saved",
+                "street": main_street,
+                "between": between,
+                "blockside": blockside,
+                "next_sweep_date": next_sweep_date.date(),
+                "next_sweep_time": int(SS_at_loc['fromhour'].values[0]),
+                "days_until_sweep": days_until_sweep
+            }
+
+        #determine streetside
+        line = closest_street['geometry'].iloc[0]
         closest_point = line.interpolate(line.project(user_point))
 
         blockside = ''
@@ -98,16 +145,16 @@ def get_next_sweep(location: Location):
                 blockside = 'On the Line'
 
         # Filter by correct block side
-        parking_loc_sss = closest_streets[closest_streets.BlockSide == blockside]
-        # print(parking_loc_sss.iloc[0])
-        if parking_loc_sss.empty:
-            raise HTTPException(status_code=404, detail="No street sweeping schedule found for this location.")
+        print('STREETSIDES', street_sides)
+        print(street_sides['blockside'])
+        
+        SS_at_loc = street_sides[street_sides.blockside == blockside]
+        print(SS_at_loc)
+        print(blockside)
 
-        main_street = parking_loc_sss['Corridor'].iloc[0]
-        limits = parking_loc_sss['Limits'].iloc[0].split('-')
-        # print(f'you are parked on  {main_street} between {limits[0]} and {limits[1]}')
-        # print(parking_loc_sss)
-        # Get next sweeping day
+        blockside = SS_at_loc['blockside'].values[0]
+        print('you are parked on the', blockside, 'side of', main_street, 'between',between[0], 'and', between[1])
+        
         weekdays = ['Mon', 'Tues', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
         next_sweep_date = None
 
@@ -115,44 +162,42 @@ def get_next_sweep(location: Location):
             day_to_check = now + timedelta(days=i)
             weekday = weekdays[day_to_check.weekday()]
             occurrence = (day_to_check.day - 1) // 7 + 1
-            if (parking_loc_sss['WeekDay'].iloc[0] == weekday) and (parking_loc_sss[f'Week{occurrence}'].iloc[0] == 1):
-                next_sweep_date = day_to_check.strftime("%A, %B %d")
+            if (SS_at_loc['weekday'].iloc[0] == weekday) and (SS_at_loc[f'week{occurrence}'].iloc[0] == 1):
+                next_sweep_date = day_to_check
                 days_until_sweep = i
                 break
+        print('NEXT SWEEP:', next_sweep_date, "AT", days_until_sweep)
 
-        if not next_sweep_date:
-            raise HTTPException(status_code=404, detail="No upcoming street sweeping found.")
-
-        rJSON =  {
-            "street": main_street,
-            "blockside": blockside,
-            "location_limits": f"{limits[0].strip()} - {limits[1].strip()}",
-            "next_sweep_date": next_sweep_date,
-            "next_sweep_time": (int(parking_loc_sss['FromHour'].iloc[0]), int(parking_loc_sss['ToHour'].iloc[0])),
-            "days_until_sweep": int(days_until_sweep)
+        db_record = ParkingRecordDB(
+            phone_number=int(location.phone_number),
+            latitude=float(location.latitude),
+            longitude=float(location.longitude),
+            street_name=str(main_street),
+            between = str(between),
+            blockside = str(blockside),
+            cnn = int(cnn),
+            next_sweep_date=next_sweep_date.date(),
+            next_sweep_time=int(SS_at_loc['fromhour'].values[0])
+        )
+        db = SessionLocal()
+        db.add(db_record)
+        db.commit()
+        db.refresh(db_record)  
+        db.close()
+        
+        # Return a response
+        return {
+            "message": 
+                f"""Parked on {main_street} between {between[0]} and {between[1]}.
+                You've got {days_until_sweep} days until
+                next sweep on {next_sweep_date.date()} at {int(SS_at_loc['fromhour'].values[0])}"""
         }
 
-        db = SessionLocal()
-        parking_record = ParkingRecord(
-            phone_number=location.phone_number,
-            latitude=location.latitude,
-            longitude=location.longitude,
-            street=main_street,
-            blockside=blockside,
-            next_sweep_date=next_sweep_date,
-            next_sweep_time=str(rJSON["next_sweep_time"]),
-            days_until_sweep=int(days_until_sweep),
-            notified=0
-        )
-        db.add(parking_record)
-        db.commit()
-        db.close()
-
-        # print(rJSON)
-        return rJSON
-
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        error_traceback = traceback.format_exc()
+        print(error_traceback)
+        raise HTTPException(status_code=500, detail=f"{str(e)}\n\nTraceback:\n{error_traceback}")
 
 
 
